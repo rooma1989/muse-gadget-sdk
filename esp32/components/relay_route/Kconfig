@@ -1,0 +1,27 @@
+menu "Relay route"
+
+    config RELAY_ROUTE_ENABLE
+        bool "Reach Muse through your own TCP relay"
+        default n
+        help
+            For networks where Muse's hostnames are DNS-poisoned or their IPs
+            are blocked. Each hostname in RELAY_ROUTE_MAP is sent to
+            RELAY_ROUTE_IP on its own port, which must forward the raw TCP
+            stream to that hostname's port 443 (for example an Xray "tunnel"
+            / dokodemo-door inbound with a fixed target). TLS stays end to
+            end: the certificate is still checked against the real hostname.
+            Needs CONFIG_LWIP_HOOK_NETCONN_EXT_RESOLVE_CUSTOM=y.
+
+    config RELAY_ROUTE_IP
+        string "Relay IPv4 address"
+        depends on RELAY_ROUTE_ENABLE
+        default ""
+
+    config RELAY_ROUTE_MAP
+        string "Hostname=port pairs"
+        depends on RELAY_ROUTE_ENABLE
+        default "api.muse.ai=47444 hatch.metaaivm.com=47445"
+        help
+            Space-separated host=port pairs, exact hostnames, at most 8.
+
+endmenu
