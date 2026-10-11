@@ -132,6 +132,7 @@ static struct {
     bool after_note;
     char error[EV_TEXT];                /* why the turn failed, repeated at the release */
     /* Reading the reply aloud through the speech server (CONFIG_MUSE_ASR_ENABLE). */
+    bool sub_lost;                      /* the session dropped after the reply came */
     bool speak;                         /* this turn's reply is spoken */
     bool tts_on;                        /* a stretch of it is being spoken */
     size_t spoken;                      /* bytes of text handed to the speech server */
@@ -845,8 +846,16 @@ static void pump(void)
     bool skipped_big = s_skipped_big;
     xSemaphoreGive(s_rx_lock);
     if (status < 0 || status >= 400) {
-        subscription_error(status);
-        return;
+        if (s_turn.phase != T_REPLY || !s_turn.replied) {
+            subscription_error(status);
+            return;
+        }
+        /* The session dropped after the reply came (it reconnects by itself):
+         * finish showing and speaking what arrived rather than failing. */
+        if (!s_turn.sub_lost) {
+            ESP_LOGW(TAG, "connection lost after the reply (%d); finishing with what arrived", status);
+            s_turn.sub_lost = true;
+        }
     }
     if (s_turn.phase == T_REPLY) {
         for (;;) {

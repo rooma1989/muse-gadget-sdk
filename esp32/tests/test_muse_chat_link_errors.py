@@ -316,6 +316,10 @@ static void denied_and_ack(void) {
     begin(); release(); note_ack(); now+=REPLY_TIMEOUT_US+1; pump();
     assert(s_turn.phase==T_IDLE && strstr(s_turn.error,"NO REPLY"));
     begin(); release(); note_ack(); final("retry","note","Recovered"); assert_replied("Recovered");
+    /* The session drops once the reply is here: the turn still finishes with it. */
+    feed(RX_SUB,-1,NULL,0,true); pump();
+    assert(s_turn.phase==T_REPLY && s_turn.sub_lost && !s_turn.error[0]);
+    now+=20000000; pump(); assert(s_turn.phase==T_IDLE && !s_turn.error[0]);
 }
 static void transcript_and_lines(void) {
     begin(); release();
