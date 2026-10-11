@@ -201,6 +201,14 @@ menu "Muse"
         depends on MUSE_ASR_ENABLE
         default "/asr"
 
+    config MUSE_TTS_PATH
+        string "HTTP path for reading replies aloud"
+        depends on MUSE_ASR_ENABLE
+        default "/tts"
+        help
+            With the speaker on (Settings), each reply is spoken by the same
+            server. Empty: replies are only shown.
+
     config MUSE_ASR_KEY
         string "Shared key (64 hex digits)"
         depends on MUSE_ASR_ENABLE

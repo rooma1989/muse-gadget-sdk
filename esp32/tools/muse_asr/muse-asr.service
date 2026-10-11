@@ -1,5 +1,5 @@
 [Unit]
-Description=Speech-to-text for Muse gadgets (tools/muse_asr)
+Description=Speech-to-text and text-to-speech for Muse gadgets (tools/muse_asr)
 After=network-online.target
 
 [Service]
@@ -8,12 +8,13 @@ Group=museasr
 WorkingDirectory=/opt/muse-asr
 Environment=MUSE_ASR_KEY_FILE=/etc/muse-asr/key
 Environment=MUSE_ASR_MODEL=/opt/muse-asr/model
+Environment=MUSE_TTS_DIR=/opt/muse-asr
 Environment=MUSE_ASR_LISTEN=127.0.0.1:8102
 ExecStart=/opt/muse-asr/venv/bin/python /opt/muse-asr/app/server.py
 Restart=on-failure
 RestartSec=3
-# The model takes ~300 MB; keep it from crowding out the host's other services.
-MemoryMax=700M
+# ASR plus one TTS model take ~600 MB; keep them from crowding out the host's other services.
+MemoryMax=900M
 Nice=5
 NoNewPrivileges=yes
 ProtectSystem=strict

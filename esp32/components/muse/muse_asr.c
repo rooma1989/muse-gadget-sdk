@@ -1,9 +1,11 @@
 /*
- * Push-to-talk through your own speech-to-text server. See muse_asr.h, and
- * tools/muse_asr/protocol.py for the wire format: a chunked HTTP POST of a
- * 16-byte hello and AES-256-GCM frames of PCM, answered by one sealed frame
- * holding {"text": ...}. Plain TCP to a nearby server: no second TLS session,
- * which a board without PSRAM has no room for beside Link's.
+ * Push-to-talk, and reading replies aloud, through your own speech server.
+ * See muse_asr.h, and tools/muse_asr/protocol.py for the wire format: a
+ * chunked HTTP POST of a 16-byte hello and AES-256-GCM frames of PCM, answered
+ * by one sealed frame holding {"text": ...}; and for speech, a POST of one
+ * sealed text frame answered by a stream of sealed IMA ADPCM. Plain TCP to a
+ * nearby server: no second TLS session, which a board without PSRAM has no
+ * room for beside Link's.
  */
 #include "sdkconfig.h"
 
@@ -21,6 +23,8 @@
 #include "cJSON.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_timer.h"
+#include "muse_adpcm.h"
 #include "lwip/sockets.h"
 #include "psa/crypto.h"
 
@@ -33,6 +37,8 @@ static const char *TAG = "muse_asr";
 #define T_AUDIO 1
 #define T_END 2
 #define T_RESULT 3
+#define T_TEXT 4
+#define T_SEGMENT 5
 #define SERVER_COUNTER 0x80000000u
 #define CONNECT_MS 1500
 #define SEND_MS 1000
@@ -80,20 +86,20 @@ static bool load_key(void)
     return true;
 }
 
-static void nonce(uint32_t counter, uint8_t out[12])
+static void nonce(const uint8_t *hello, uint32_t counter, uint8_t out[12])
 {
-    memcpy(out, s_hello + 4, 8);
+    memcpy(out, hello + 4, 8);
     out[8] = counter >> 24;
     out[9] = counter >> 16;
     out[10] = counter >> 8;
     out[11] = counter;
 }
 
-static bool send_all(const void *data, size_t len)
+static bool send_on(int sock, const void *data, size_t len)
 {
     const uint8_t *p = data;
     while (len) {
-        int n = send(s_sock, p, len, 0);
+        int n = send(sock, p, len, 0);
         if (n <= 0) {
             ESP_LOGW(TAG, "send failed: errno %d", errno);
             return false;
@@ -102,6 +108,11 @@ static bool send_all(const void *data, size_t len)
         len -= n;
     }
     return true;
+}
+
+static bool send_all(const void *data, size_t len)
+{
+    return send_on(s_sock, data, len);
 }
 
 /* Sends `len` bytes as one HTTP chunk; the bytes sit at s_out + 8. */
@@ -120,7 +131,7 @@ static bool send_frame(uint8_t type)
 {
     s_plain[0] = type;
     uint8_t n[12];
-    nonce(s_counter++, n);
+    nonce(s_hello, s_counter++, n);
     size_t ct_len = 0;
     uint8_t *ct = s_out + 8 + 2;
     psa_status_t st = psa_aead_encrypt(s_key, PSA_ALG_GCM, n, sizeof(n), s_hello, HELLO_LEN,
@@ -135,38 +146,55 @@ static bool send_frame(uint8_t type)
     return send_chunk(2 + ct_len);
 }
 
-static bool connect_to_server(void)
+/* A blocking TCP socket to the server with a send timeout, or -1. */
+static int open_socket(void)
 {
     struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(CONFIG_MUSE_ASR_PORT) };
     if (inet_aton(CONFIG_MUSE_ASR_IP, &addr.sin_addr) == 0) {
         ESP_LOGE(TAG, "bad CONFIG_MUSE_ASR_IP");
-        return false;
+        return -1;
     }
-    s_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s_sock < 0) return false;
-    int fl = fcntl(s_sock, F_GETFL, 0);
-    fcntl(s_sock, F_SETFL, fl | O_NONBLOCK);
-    int rc = connect(s_sock, (struct sockaddr *)&addr, sizeof(addr));
+    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock < 0) return -1;
+    int fl = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, fl | O_NONBLOCK);
+    int rc = connect(sock, (struct sockaddr *)&addr, sizeof(addr));
     if (rc < 0 && errno == EINPROGRESS) {
         fd_set w;
         FD_ZERO(&w);
-        FD_SET(s_sock, &w);
+        FD_SET(sock, &w);
         struct timeval tv = { CONNECT_MS / 1000, (CONNECT_MS % 1000) * 1000 };
         int err = 0;
         socklen_t el = sizeof(err);
-        rc = select(s_sock + 1, NULL, &w, NULL, &tv) == 1
-             && getsockopt(s_sock, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == 0 ? 0 : -1;
+        rc = select(sock + 1, NULL, &w, NULL, &tv) == 1
+             && getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == 0 ? 0 : -1;
     }
     if (rc < 0) {
         ESP_LOGW(TAG, "can't connect to %s:%d", CONFIG_MUSE_ASR_IP, CONFIG_MUSE_ASR_PORT);
-        return false;
+        close(sock);
+        return -1;
     }
-    fcntl(s_sock, F_SETFL, fl & ~O_NONBLOCK);
+    fcntl(sock, F_SETFL, fl & ~O_NONBLOCK);
     struct timeval tv = { SEND_MS / 1000, (SEND_MS % 1000) * 1000 };
-    setsockopt(s_sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     int one = 1;
-    setsockopt(s_sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    return true;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    return sock;
+}
+
+static const char *host_header(void)
+{
+    return CONFIG_MUSE_ASR_HOST[0] ? CONFIG_MUSE_ASR_HOST : CONFIG_MUSE_ASR_IP;
+}
+
+static void new_hello(uint8_t hello[HELLO_LEN])
+{
+    memcpy(hello, "MSR1", 4);
+    esp_fill_random(hello + 4, 8);
+    hello[12] = RATE & 0xff;
+    hello[13] = (RATE >> 8) & 0xff;
+    hello[14] = 0;
+    hello[15] = 0;
 }
 
 bool muse_asr_begin(void)
@@ -175,7 +203,7 @@ bool muse_asr_begin(void)
     if (!load_key()) return false;
     s_plain = malloc(1 + FRAME_PCM);
     s_out = malloc(OUT_CAP);
-    if (!s_plain || !s_out || !connect_to_server()) {
+    if (!s_plain || !s_out || (s_sock = open_socket()) < 0) {
         muse_asr_close();
         return false;
     }
@@ -183,13 +211,8 @@ bool muse_asr_begin(void)
     int n = snprintf(req, sizeof(req),
                      "POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: application/octet-stream\r\n"
                      "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
-                     CONFIG_MUSE_ASR_PATH, CONFIG_MUSE_ASR_HOST[0] ? CONFIG_MUSE_ASR_HOST : CONFIG_MUSE_ASR_IP);
-    memcpy(s_hello, "MSR1", 4);
-    esp_fill_random(s_hello + 4, 8);
-    s_hello[12] = RATE & 0xff;
-    s_hello[13] = (RATE >> 8) & 0xff;
-    s_hello[14] = 0;
-    s_hello[15] = 0;
+                     CONFIG_MUSE_ASR_PATH, host_header());
+    new_hello(s_hello);
     s_counter = 0;
     s_fill = 0;
     memcpy(s_out + 8, s_hello, HELLO_LEN);
@@ -238,7 +261,7 @@ static int open_result(const uint8_t *body, size_t len, char *text, size_t cap)
     size_t ct_len = body[0] | body[1] << 8;
     if (ct_len + 2 > len || ct_len <= TAG_LEN) return -1;
     uint8_t n[12];
-    nonce(SERVER_COUNTER, n);
+    nonce(s_hello, SERVER_COUNTER, n);
     size_t plain_len = 0;
     /* Decrypt in place over the tail of s_out: no new buffer. */
     uint8_t *plain = s_out;
@@ -304,6 +327,210 @@ void muse_asr_close(void)
     s_rx = NULL;
     s_fill = 0;
     s_rx_len = 0;
+}
+
+/* ---- Reading a reply aloud ---- */
+
+#define TTS_ADPCM_MAX 2048          /* ADPCM bytes per frame, as the server sends */
+#define TTS_PLAIN_CAP (1 + TTS_ADPCM_MAX)
+#define TTS_RX_CAP (2 + TTS_PLAIN_CAP + TAG_LEN + 384)   /* a frame, or the response head */
+#define TTS_TEXT_MAX 1200
+
+static struct {
+    int sock;
+    uint8_t hello[HELLO_LEN];
+    uint32_t counter;
+    uint8_t *rx;
+    size_t rx_len;
+    bool head;                      /* the HTTP head is behind us */
+    uint8_t *plain;                 /* the frame being decoded: type byte + ADPCM */
+    size_t plain_len, plain_off;
+    muse_adpcm_t adpcm;
+    bool done, failed;
+    /* The sentence being said: its samples and where it sits in the text. */
+    uint32_t seg_base, seg_samples, delivered;
+    uint16_t seg_from, seg_to;
+    int64_t t0;
+} s_tts = { .sock = -1 };
+
+static void tts_fail(const char *why)
+{
+    if (!s_tts.failed) ESP_LOGW(TAG, "speech: %s", why);
+    s_tts.failed = true;
+}
+
+bool muse_tts_begin(const char *text, size_t len, int voice)
+{
+    muse_tts_close();
+    if (!CONFIG_MUSE_TTS_PATH[0] || !load_key()) return false;
+    if (len > TTS_TEXT_MAX) {
+        len = TTS_TEXT_MAX;
+        while (len && (text[len] & 0xC0) == 0x80) len--;   /* whole UTF-8 characters */
+    }
+    size_t ct_cap = 2 + len + TAG_LEN;
+    size_t body_len = HELLO_LEN + 2 + ct_cap;
+    uint8_t *body = malloc(body_len);
+    uint8_t *plain = malloc(2 + len);
+    s_tts.rx = malloc(TTS_RX_CAP);
+    s_tts.plain = malloc(TTS_PLAIN_CAP);
+    bool ok = body && plain && s_tts.rx && s_tts.plain && (s_tts.sock = open_socket()) >= 0;
+    if (ok) {
+        new_hello(s_tts.hello);
+        memcpy(body, s_tts.hello, HELLO_LEN);
+        plain[0] = T_TEXT;
+        plain[1] = (uint8_t)voice;
+        memcpy(plain + 2, text, len);
+        uint8_t n[12];
+        nonce(s_tts.hello, 0, n);
+        size_t ct_len = 0;
+        ok = psa_aead_encrypt(s_key, PSA_ALG_GCM, n, sizeof(n), s_tts.hello, HELLO_LEN, plain, 2 + len,
+                              body + HELLO_LEN + 2, ct_cap, &ct_len) == PSA_SUCCESS;
+        body[HELLO_LEN] = ct_len & 0xff;
+        body[HELLO_LEN + 1] = ct_len >> 8;
+        char req[200];
+        int h = snprintf(req, sizeof(req),
+                         "POST %s HTTP/1.0\r\nHost: %s\r\nContent-Type: application/octet-stream\r\n"
+                         "Content-Length: %u\r\n\r\n", CONFIG_MUSE_TTS_PATH, host_header(), (unsigned)body_len);
+        ok = ok && send_on(s_tts.sock, req, h) && send_on(s_tts.sock, body, body_len);
+    }
+    free(body);
+    free(plain);
+    if (!ok) {
+        ESP_LOGW(TAG, "speech: can't reach the server");
+        muse_tts_close();
+        return false;
+    }
+    int fl = fcntl(s_tts.sock, F_GETFL, 0);
+    fcntl(s_tts.sock, F_SETFL, fl | O_NONBLOCK);
+    s_tts.counter = SERVER_COUNTER;
+    s_tts.t0 = esp_timer_get_time();
+    return true;
+}
+
+/* Reads what the socket has; false once it's closed or failed. */
+static bool tts_fill(void)
+{
+    if (s_tts.rx_len >= TTS_RX_CAP) {
+        tts_fail("frame too big");
+        return false;
+    }
+    int n = recv(s_tts.sock, s_tts.rx + s_tts.rx_len, TTS_RX_CAP - s_tts.rx_len, 0);
+    if (n > 0) {
+        s_tts.rx_len += n;
+        return true;
+    }
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return false;
+    if (!s_tts.done) tts_fail("server closed early");
+    return false;
+}
+
+static void tts_consume(size_t n)
+{
+    memmove(s_tts.rx, s_tts.rx + n, s_tts.rx_len - n);
+    s_tts.rx_len -= n;
+}
+
+/* Opens the next frame into s_tts.plain. False if none is complete yet. */
+static bool tts_next_frame(void)
+{
+    for (;;) {
+        if (!s_tts.head) {
+            uint8_t *end = s_tts.rx_len >= 4 ? memmem(s_tts.rx, s_tts.rx_len, "\r\n\r\n", 4) : NULL;
+            if (end) {
+                int status = 0;
+                s_tts.rx[s_tts.rx_len < TTS_RX_CAP ? s_tts.rx_len : TTS_RX_CAP - 1] = 0;
+                sscanf((const char *)s_tts.rx, "HTTP/1.%*d %d", &status);
+                if (status != 200) {
+                    ESP_LOGW(TAG, "speech: server answered %d", status);
+                    tts_fail("refused");
+                    return false;
+                }
+                tts_consume(end + 4 - s_tts.rx);
+                s_tts.head = true;
+                continue;
+            }
+        } else if (s_tts.rx_len >= 2) {
+            size_t ct_len = s_tts.rx[0] | s_tts.rx[1] << 8;
+            if (ct_len <= TAG_LEN || ct_len > TTS_PLAIN_CAP + TAG_LEN) {
+                tts_fail("bad frame");
+                return false;
+            }
+            if (s_tts.rx_len >= 2 + ct_len) {
+                uint8_t n[12];
+                nonce(s_tts.hello, s_tts.counter++, n);
+                size_t plain_len = 0;
+                if (psa_aead_decrypt(s_key, PSA_ALG_GCM, n, sizeof(n), s_tts.hello, HELLO_LEN, s_tts.rx + 2,
+                                     ct_len, s_tts.plain, TTS_PLAIN_CAP, &plain_len) != PSA_SUCCESS
+                    || plain_len < 1) {
+                    tts_fail("frame didn't open");
+                    return false;
+                }
+                tts_consume(2 + ct_len);
+                s_tts.plain_len = plain_len;
+                s_tts.plain_off = 1;
+                return true;
+            }
+        }
+        if (!tts_fill()) return false;
+    }
+}
+
+size_t muse_tts_read(int16_t *pcm, size_t frames)
+{
+    size_t out = 0;
+    frames &= ~(size_t)1;
+    while (s_tts.sock >= 0 && out < frames && !s_tts.failed) {
+        if (s_tts.plain_off < s_tts.plain_len && s_tts.plain[0] == T_AUDIO) {
+            size_t n = (s_tts.plain_len - s_tts.plain_off) * 2;
+            if (n > frames - out) n = frames - out;
+            muse_adpcm_decode_block(&s_tts.adpcm, s_tts.plain + s_tts.plain_off, n, pcm + out);
+            if (!s_tts.delivered) {
+                ESP_LOGI(TAG, "speech after %.2fs", (esp_timer_get_time() - s_tts.t0) / 1e6);
+            }
+            s_tts.plain_off += n / 2;
+            s_tts.delivered += n;
+            out += n;
+            continue;
+        }
+        s_tts.plain_off = s_tts.plain_len;
+        if (s_tts.done || !tts_next_frame()) break;
+        if (s_tts.plain[0] == T_SEGMENT && s_tts.plain_len >= 7) {
+            const uint8_t *p = s_tts.plain + 1;
+            s_tts.seg_from = s_tts.seg_to;
+            s_tts.seg_samples = p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24;
+            s_tts.seg_to = p[4] | p[5] << 8;
+            s_tts.seg_base = s_tts.delivered;
+        } else if (s_tts.plain[0] == T_END) {
+            s_tts.done = true;
+            ESP_LOGI(TAG, "speech: %.2fs in %.2fs", s_tts.delivered / (double)RATE,
+                     (esp_timer_get_time() - s_tts.t0) / 1e6);
+        }
+    }
+    return out;
+}
+
+int muse_tts_state(void)
+{
+    if (s_tts.failed) return -1;
+    bool drained = s_tts.plain_off >= s_tts.plain_len;
+    return s_tts.sock >= 0 && !(s_tts.done && drained) ? 0 : 1;
+}
+
+size_t muse_tts_text_at(void)
+{
+    if (!s_tts.seg_samples) return s_tts.seg_from;
+    uint32_t in = s_tts.delivered - s_tts.seg_base;
+    if (in > s_tts.seg_samples) in = s_tts.seg_samples;
+    return s_tts.seg_from + (size_t)(s_tts.seg_to - s_tts.seg_from) * in / s_tts.seg_samples;
+}
+
+void muse_tts_close(void)
+{
+    if (s_tts.sock >= 0) close(s_tts.sock);
+    free(s_tts.rx);
+    free(s_tts.plain);
+    memset(&s_tts, 0, sizeof(s_tts));
+    s_tts.sock = -1;
 }
 
 #endif /* CONFIG_MUSE_ASR_ENABLE */

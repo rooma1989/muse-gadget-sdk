@@ -42,6 +42,7 @@
 #include "muse_asr.h"
 #include "muse_audio.h"
 #include "muse_link.h"
+#include "muse_settings.h"
 #include "muse_wifi.h"
 
 static const char *TAG = "muse_chat_link";
@@ -70,6 +71,7 @@ static const char *TAG = "muse_chat_link";
 #define READ_CHARS_PER_S 14             /* caption scroll, about speaking pace */
 #define ASR_TIMEOUT_US 15000000         /* release -> transcript from the speech server */
 #define ASR_TEXT_MAX 600
+#define SPOKEN_SETTLE_US 1500000        /* quiet after the last speech before the turn ends */
 
 
 /* A reply being received on Link's session task, read by the voice task once done. */
@@ -129,6 +131,12 @@ static struct {
     bool heard, replied;
     bool after_note;
     char error[EV_TEXT];                /* why the turn failed, repeated at the release */
+    /* Reading the reply aloud through the speech server (CONFIG_MUSE_ASR_ENABLE). */
+    bool speak;                         /* this turn's reply is spoken */
+    bool tts_on;                        /* a stretch of it is being spoken */
+    size_t spoken;                      /* bytes of text handed to the speech server */
+    size_t tts_base;                    /* where the stretch being spoken starts */
+    int64_t t_spoke;                    /* when the last stretch finished */
     char text[TEXT_MAX];
     char shown[EV_TEXT];
 } s_turn;
@@ -572,6 +580,8 @@ static void end_turn(void)
 {
 #if CONFIG_MUSE_ASR_ENABLE
     muse_asr_close();
+    muse_tts_close();
+    s_turn.tts_on = false;
 #endif
     drop(RX_NOTE);
     drop(RX_SUB);
@@ -775,6 +785,43 @@ static void pump_asr(int64_t now)
 }
 #endif
 
+#if CONFIG_MUSE_ASR_ENABLE
+/* Stops speaking; the rest of the reply scrolls at reading pace from here. */
+static void stop_speaking(int64_t now, size_t at)
+{
+    muse_tts_close();
+    s_turn.tts_on = false;
+    s_turn.speak = false;
+    s_turn.t_show = now - (int64_t)at * 1000000 / READ_CHARS_PER_S;
+}
+
+/* Hands each new stretch of the reply to the speech server as the last one ends. */
+static void speak_pump(int64_t now)
+{
+    size_t len = strlen(s_turn.text);
+    if (s_turn.tts_on) {
+        int state = muse_tts_state();
+        if (state == 0) return;
+        if (state < 0) {
+            stop_speaking(now, s_turn.tts_base + muse_tts_text_at());
+            return;
+        }
+        muse_tts_close();
+        s_turn.tts_on = false;
+        s_turn.t_spoke = now;
+    }
+    if (s_turn.spoken < len) {
+        if (muse_tts_begin(s_turn.text + s_turn.spoken, len - s_turn.spoken, muse_settings_voice())) {
+            s_turn.tts_on = true;
+            s_turn.tts_base = s_turn.spoken;
+            s_turn.spoken = len;
+        } else {
+            stop_speaking(now, s_turn.spoken);
+        }
+    }
+}
+#endif
+
 /* Moves the turn along; runs on the voice task each time it asks for events. */
 static void pump(void)
 {
@@ -825,6 +872,24 @@ static void pump(void)
         return;
     }
     if (s_turn.replied) {
+#if CONFIG_MUSE_ASR_ENABLE
+        if (s_turn.speak) {
+            if (!s_turn.spoken) {
+                /* Up front, so the voice task shows the opening page. */
+                char line[EV_TEXT];
+                if (muse_hatch_caption_at(s_turn.text, 0, line, sizeof(line))) emit(MUSE_HATCH_EV_REPLY, line);
+            }
+            speak_pump(now);
+            if (s_turn.speak) {
+                if (!s_turn.tts_on && s_turn.spoken >= strlen(s_turn.text)
+                    && now - s_turn.t_reply > SETTLE_US && now - s_turn.t_spoke > SPOKEN_SETTLE_US) {
+                    end_turn();
+                    emit(MUSE_HATCH_EV_DONE, NULL);
+                }
+                return;
+            }
+        }
+#endif
         if (scroll(now) && now - s_turn.t_reply > SETTLE_US) {
             end_turn();
             emit(MUSE_HATCH_EV_DONE, NULL);
@@ -904,6 +969,7 @@ void muse_hatch_turn_begin(void)
         fail("CAN'T REACH SPEECH SERVER");
         return;
     }
+    s_turn.speak = muse_settings_speaker_on() && CONFIG_MUSE_TTS_PATH[0];
     s_turn.phase = T_TALKING;
     return;
 #endif
@@ -1014,19 +1080,31 @@ muse_hatch_ev_t muse_hatch_turn_event(char *text, size_t cap)
 
 bool muse_hatch_turn_caption(size_t played, char *out, size_t cap)
 {
-    (void)played;   /* no speech: the reply's page follows the reading pace */
+    (void)played;   /* the reply's page follows the speech, or else the reading pace */
     size_t len = strlen(s_turn.text);
     if (s_turn.phase != T_REPLY || !s_turn.replied || !len) {
         return false;
     }
     size_t at = read_at(esp_timer_get_time());
+#if CONFIG_MUSE_ASR_ENABLE
+    if (s_turn.speak) {
+        at = s_turn.tts_on ? s_turn.tts_base + muse_tts_text_at() : (s_turn.spoken ? s_turn.spoken - 1 : 0);
+    }
+#endif
     return muse_hatch_caption_at(s_turn.text, at < len ? at : len - 1, out, cap);
 }
 
 size_t muse_hatch_turn_read(int16_t *pcm, size_t frames, int wait_ms)
 {
+#if CONFIG_MUSE_ASR_ENABLE
+    if (s_turn.tts_on) {
+        size_t n = muse_tts_read(pcm, frames);
+        if (n) return n;
+    }
+#else
     (void)pcm;
     (void)frames;
+#endif
     if (wait_ms > 0) {
         vTaskDelay(pdMS_TO_TICKS(wait_ms) ? pdMS_TO_TICKS(wait_ms) : 1);
     }

@@ -34,6 +34,7 @@ static const char *TAG = "muse_settings";
 static struct {
     uint8_t volume;
     bool speaker_on;
+    uint8_t voice;
     uint8_t mic_gain;
     uint8_t brightness;
     uint16_t sleep_s;
@@ -118,6 +119,7 @@ esp_err_t muse_settings_init(void)
     if (nvs_get_u8(s_nvs, "speaker", &b) == ESP_OK) {
         s.speaker_on = b;
     }
+    load_u8("voice", &s.voice);
     load_u8("mic_gain", &s.mic_gain);
     load_u8("bright", &s.brightness);
     nvs_get_u16(s_nvs, "sleep_s", &s.sleep_s);
@@ -149,6 +151,7 @@ void muse_settings_set_listener(muse_setting_cb_t cb)
 
 int muse_settings_volume(void) { return s.volume; }
 bool muse_settings_speaker_on(void) { return s.speaker_on; }
+int muse_settings_voice(void) { return s.voice; }
 int muse_settings_mic_gain(void) { return s.mic_gain; }
 int muse_settings_brightness(void) { return s.brightness; }
 int muse_settings_sleep_s(void) { return s.sleep_s; }
@@ -203,6 +206,12 @@ void muse_settings_set_speaker_on(bool on)
     s.speaker_on = on;
     save_u8("speaker", on);
     notify(MUSE_SETTING_SPEAKER);
+}
+
+void muse_settings_set_voice(int voice)
+{
+    s.voice = clampi(voice, 0, 255);
+    save_u8("voice", s.voice);
 }
 
 void muse_settings_set_mic_gain(int db)

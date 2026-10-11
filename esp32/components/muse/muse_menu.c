@@ -64,6 +64,9 @@ static const char *TAG = "muse_menu";
 typedef enum {
     ITEM_VOLUME,
     ITEM_SPEAKER,
+#if CONFIG_MUSE_ASR_ENABLE
+    ITEM_VOICE,
+#endif
     ITEM_BRIGHTNESS,
     ITEM_MIC,
     ITEM_SLEEP,
@@ -81,6 +84,9 @@ typedef enum {
 static const char *const ITEM_NAMES[ITEM_COUNT] = {
     [ITEM_VOLUME] = "Volume",
     [ITEM_SPEAKER] = "Speaker",
+#if CONFIG_MUSE_ASR_ENABLE
+    [ITEM_VOICE] = "Voice",
+#endif
     [ITEM_BRIGHTNESS] = "Brightness",
     [ITEM_MIC] = "Mic gain",
     [ITEM_SLEEP] = "Auto-sleep",
@@ -98,6 +104,9 @@ static const char *const ITEM_NAMES[ITEM_COUNT] = {
 static const char *const ITEM_ACTIONS[ITEM_COUNT] = {
     [ITEM_VOLUME] = "Change",
     [ITEM_SPEAKER] = "Toggle",
+#if CONFIG_MUSE_ASR_ENABLE
+    [ITEM_VOICE] = "Change",
+#endif
     [ITEM_BRIGHTNESS] = "Change",
     [ITEM_MIC] = "Change",
     [ITEM_SLEEP] = "Change",
@@ -117,6 +126,10 @@ static const int BRIGHT_STEPS[] = { 10, 25, 50, 75, 100 };
 static const int GAIN_STEPS[] = { 0, 6, 12, 18, 24, 30, 36 };
 static const int SLEEP_STEPS[] = { 0, 30, 60, 120, 300, 600 };
 static const char *const SLEEP_NAMES[] = { "Never", "30 s", "1 min", "2 min", "5 min", "10 min" };
+#if CONFIG_MUSE_ASR_ENABLE
+/* The speech server's voices, in its order (tools/muse_asr/server.py VOICES). */
+static const char *const VOICE_NAMES[] = { "ll-0", "ll-2", "fc-0" };
+#endif
 #define COUNT(a) ((int)(sizeof(a) / sizeof((a)[0])))
 
 typedef enum {
@@ -206,6 +219,13 @@ static void value_text(int item, char *buf, size_t n)
     case ITEM_SPEAKER:
         strlcpy(buf, muse_settings_speaker_on() ? "On" : "Off", n);
         break;
+#if CONFIG_MUSE_ASR_ENABLE
+    case ITEM_VOICE: {
+        int v = muse_settings_voice();
+        strlcpy(buf, VOICE_NAMES[v < COUNT(VOICE_NAMES) ? v : 0], n);
+        break;
+    }
+#endif
     case ITEM_BRIGHTNESS:
         snprintf(buf, n, "%d%%", muse_settings_brightness());
         break;
@@ -396,6 +416,13 @@ static void activate(int item, int direction)
     case ITEM_SPEAKER:
         muse_settings_set_speaker_on(!muse_settings_speaker_on());
         break;
+#if CONFIG_MUSE_ASR_ENABLE
+    case ITEM_VOICE: {
+        int v = muse_settings_voice() + (direction < 0 ? COUNT(VOICE_NAMES) - 1 : 1);
+        muse_settings_set_voice(v % COUNT(VOICE_NAMES));
+        break;
+    }
+#endif
     case ITEM_BRIGHTNESS:
         muse_settings_set_brightness(value_step(BRIGHT_STEPS, COUNT(BRIGHT_STEPS), muse_settings_brightness(), direction));
         break;

@@ -1,25 +1,30 @@
 #!/usr/bin/env python3
-"""Speech-to-text for a Muse gadget that can't upload voice notes to Muse.
+"""Speech-to-text and text-to-speech for a Muse gadget without PSRAM.
 
 The AI Passport (ESP32-C3, no PSRAM) reaches Muse through a relay with a long
 round trip, and can neither upload a voice note fast enough nor receive the
 16 KB frame Muse echoes it back with. Instead it streams the mic here (a nearby
 server), gets the transcript back, and sends Muse plain text.
 
-Listens on plain HTTP behind nginx (POST, chunked body; see protocol.py).
-SenseVoice-Small through sherpa-onnx does the recognition, on CPU.
+Listens on plain HTTP behind nginx (see protocol.py). POST /asr: SenseVoice-
+Small through sherpa-onnx transcribes the mic. POST /tts: VITS voices through
+sherpa-onnx read a reply aloud, sentence by sentence, as 16 kHz IMA ADPCM.
 
   MUSE_ASR_KEY_FILE  hex AES-256 key shared with the gadget (/etc/muse-asr/key)
   MUSE_ASR_MODEL     directory with model.int8.onnx and tokens.txt
+  MUSE_TTS_DIR       directory holding the VITS voices' model directories (VOICES);
+                     empty: no /tts
   MUSE_ASR_LISTEN    host:port (127.0.0.1:8102)
 
-Transcripts are never logged, only their lengths.
+Transcripts and replies are never logged, only their lengths.
 """
 
 import asyncio
 import json
 import logging
 import os
+import re
+import struct
 import sys
 import time
 
@@ -27,6 +32,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import protocol as P  # noqa: E402
 
 MAX_SECONDS = 20
+TTS_TEXT_MAX = 1500          # bytes of reply text taken
+TTS_SPEECH_MAX = 400         # characters read aloud; the rest stays on screen
+TTS_RATE = 16000
+ADPCM_FRAME = 2048           # bytes of ADPCM per frame: 256 ms
 HEADER_LIMIT = 8192
 READ_TIMEOUT = 30
 
@@ -86,7 +95,6 @@ class Recognizer:
             use_itn=True,
             language="auto",
         )
-        self.lock = asyncio.Lock()
 
     def _decode(self, pcm, rate):
         import numpy as np
@@ -97,8 +105,207 @@ class Recognizer:
         return stream.result.text.strip()
 
     async def transcribe(self, pcm, rate):
-        async with self.lock:
-            return await asyncio.get_running_loop().run_in_executor(None, self._decode, pcm, rate)
+        return await asyncio.get_running_loop().run_in_executor(None, self._decode, pcm, rate)
+
+
+# ---- Reading a reply aloud ----
+
+_SENTENCE = re.compile(r"[^。！？!?；;\n]+[。！？!?；;]*\n*|\n+")
+_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+_URL = re.compile(r"https?://\S+")
+_MARK = re.compile(r"(\*\*|__|`+|~~)")
+_LINE_START = re.compile(r"^\s*(#+|[-*+>]|\d+[.)])\s+")
+_EMOJI = re.compile("[\U0001F000-\U0001FFFF\u2600-\u27BF\uFE0F\u200D\u2B00-\u2BFF]")
+
+
+def speakable(segment):
+    """What to say for one piece of Markdown-ish chat text."""
+    t = _LINK.sub(r"\1", segment)
+    t = _URL.sub("", t)
+    t = _LINE_START.sub("", t)
+    t = _MARK.sub("", t)
+    t = _EMOJI.sub("", t)
+    return " ".join(t.split())
+
+
+# Where a clause ends: Chinese commas and colons, or ASCII ones before a space
+# (so URLs, times and 3,000 stay whole).
+_CLAUSE = re.compile(r"(?:[^，、：,:]|[,:](?!\s|$))+(?:[，、：]+|[,:]+(?=\s|$)|$)")
+MIN_PIECE = 4     # characters; a shorter clause is said together with the next
+
+
+def _words(text):
+    return sum(ch.isalnum() for ch in text)
+
+
+def segments(text):
+    """Splits text into pieces to synthesize one at a time:
+    [(what to say, UTF-8 byte offset where it ends)].
+
+    Sentences are cut at their commas too, so each piece is short: the server
+    (slower than real time on a weak CPU) synthesizes the next while the gadget
+    plays this one. A clause under MIN_PIECE characters joins the next, except
+    the reply's first, which goes alone so speech starts sooner."""
+    out = []
+    spoken = 0
+    for m in _SENTENCE.finditer(text):
+        start = m.start()
+        for c in _CLAUSE.finditer(m.group(0)):
+            end = m.start() + c.end()
+            last = c.end() == len(m.group(0))
+            say = speakable(text[start:end])
+            if not last and _words(say) < (2 if not out else MIN_PIECE):
+                continue                      # too short alone: keep gathering
+            if _words(say) == 0:
+                start = end
+                continue
+            if spoken + len(say) > TTS_SPEECH_MAX:
+                return out
+            spoken += len(say)
+            out.append((say, len(text[:end].encode())))
+            start = end
+    return out
+
+
+def resample(samples, rate):
+    """float32 at `rate` -> int16 at 16 kHz, low-passed first so it doesn't alias."""
+    import numpy as np
+    x = np.asarray(samples, dtype=np.float32)
+    if rate != TTS_RATE:
+        cutoff = 0.45 * TTS_RATE / rate          # of the input rate
+        n = np.arange(-50, 51)
+        h = 2 * cutoff * np.sinc(2 * cutoff * n) * np.hamming(len(n))
+        x = np.convolve(x, (h / h.sum()).astype(np.float32), mode="same")
+        t = np.arange(0, len(x) * TTS_RATE // rate) * (rate / TTS_RATE)
+        x = np.interp(t, np.arange(len(x)), x).astype(np.float32)
+    pcm = np.clip(x * 32767, -32768, 32767).astype(np.int16)
+    return pcm[: len(pcm) // 2 * 2]
+
+
+# The voices a gadget can pick, by the byte it sends: (model directory, speaker id).
+VOICES = [("tts-ll", 0), ("tts-ll", 2), ("tts-fc", 0)]
+
+
+def vits_config(d):
+    import sherpa_onnx
+    return sherpa_onnx.OfflineTtsConfig(
+        model=sherpa_onnx.OfflineTtsModelConfig(
+            vits=sherpa_onnx.OfflineTtsVitsModelConfig(
+                model=os.path.join(d, "model.onnx"),
+                lexicon=os.path.join(d, "lexicon.txt"),
+                tokens=os.path.join(d, "tokens.txt"),
+                dict_dir=os.path.join(d, "dict"),
+            ),
+            num_threads=2,
+        ),
+        rule_fsts=",".join(os.path.join(d, f) for f in ("date.fst", "phone.fst", "number.fst")),
+        max_num_sentences=1,
+    )
+
+
+class Speaker:
+    """sherpa-onnx VITS voices under one directory (see VOICES). One model is
+    kept loaded at a time: switching to the other takes a few seconds, once."""
+
+    def __init__(self, root):
+        self.root = root
+        self.loaded = None
+        self.tts = None
+        self.load(VOICES[0][0])
+
+    def load(self, name):
+        if self.loaded != name:
+            import sherpa_onnx
+            self.tts = None
+            t = time.monotonic()
+            self.tts = sherpa_onnx.OfflineTts(vits_config(os.path.join(self.root, name)))
+            self.loaded = name
+            log.info("tts: loaded %s in %.1fs", name, time.monotonic() - t)
+
+    def say(self, text, voice=0):
+        name, sid = VOICES[voice if 0 <= voice < len(VOICES) else 0]
+        self.load(name)
+        audio = self.tts.generate(text, sid=sid, speed=1.0)
+        return resample(audio.samples, audio.sample_rate)
+
+
+MAX_LEAD = 3.0      # seconds of speech held back at most before streaming starts
+
+
+class Pace:
+    """How fast this host synthesizes, learned per voice: seconds of compute
+    per second of speech, and seconds of speech per character."""
+
+    def __init__(self):
+        self.rtf = {}
+        self.per_char = {}
+
+    def lead(self, voice, chars):
+        """How long to hold speech back so the rest keeps up once it starts."""
+        speech = chars * self.per_char.get(voice, 0.25)
+        return max(0.0, min(MAX_LEAD, speech * (self.rtf.get(voice, 1.2) - 1)))
+
+    def learn(self, voice, chars, speech, compute):
+        if speech <= 0 or chars <= 0:
+            return
+        for table, value in ((self.rtf, compute / speech), (self.per_char, speech / chars)):
+            table[voice] = 0.7 * table.get(voice, value) + 0.3 * value
+
+
+PACE = Pace()
+
+
+async def speak(writer, key, hello, text, voice, speaker, lock, pace=PACE):
+    """Streams the reply's speech: per piece a segment frame, then its audio.
+
+    The host may synthesize slower than real time, so the first pieces are held
+    back long enough (pace.lead) that, once playing, the rest keeps up."""
+    loop = asyncio.get_running_loop()
+    counter = P.SERVER_COUNTER
+    adpcm = P.Adpcm()
+    total = 0
+    pieces = segments(text)
+    t0 = time.monotonic()
+    lead = pace.lead(voice, sum(len(say) for say, _ in pieces))
+    held = []
+    for say, end in pieces:
+        t = time.monotonic()
+        async with lock:
+            pcm = await loop.run_in_executor(None, speaker.say, say, voice)
+            data = await loop.run_in_executor(None, adpcm.encode, pcm)
+        pace.learn(voice, len(say), len(pcm) / TTS_RATE, time.monotonic() - t)
+        frames = [P.seal(key, hello, counter, P.T_SEGMENT, struct.pack("<IH", len(pcm), min(end, 0xFFFF)))]
+        counter += 1
+        for off in range(0, len(data), ADPCM_FRAME):
+            frames.append(P.seal(key, hello, counter, P.T_AUDIO, data[off:off + ADPCM_FRAME]))
+            counter += 1
+        total += len(pcm)
+        held += frames
+        if time.monotonic() - t0 >= lead:
+            writer.write(b"".join(held))
+            held = []
+            await writer.drain()
+    writer.write(b"".join(held) + P.seal(key, hello, counter, P.T_END))
+    await writer.drain()
+    return total
+
+
+async def read_text(key, reader, headers):
+    """The /tts request body: the hello, then one frame of voice byte + text."""
+    length = int(headers.get("content-length", "0"))
+    if not P.HELLO_LEN < length <= TTS_TEXT_MAX + 64:
+        raise P.ProtocolError("bad length")
+    body = await reader.readexactly(length)
+    hello = body[:P.HELLO_LEN]
+    P.parse_hello(hello)
+    frames = P.FrameReader()
+    frames.feed(body[P.HELLO_LEN:])
+    for ct in frames.frames():
+        kind, data = P.open_frame(key, hello, 0, ct)
+        if kind != P.T_TEXT or not data:
+            break
+        return hello, data[0], data[1:].decode("utf-8", "replace")
+    raise P.ProtocolError("no text frame")
 
 
 async def read_speech(key, chunks):
@@ -139,7 +346,9 @@ async def respond(writer, status, body, ctype="application/octet-stream"):
     await writer.drain()
 
 
-def make_handler(key, recognizer):
+def make_handler(key, recognizer, speaker=None, lock=None):
+    lock = lock or asyncio.Lock()
+
     async def handle(reader, writer):
         t0 = time.monotonic()
         try:
@@ -149,10 +358,21 @@ def make_handler(key, recognizer):
                 return
             if method != "POST":
                 raise HttpError(405, "POST only")
+            if path.rstrip("/").endswith("/tts"):
+                if not speaker:
+                    raise HttpError(404, "no speech")
+                hello, voice, text = await asyncio.wait_for(read_text(key, reader, headers), 10)
+                writer.write(b"HTTP/1.0 200 OK\r\nContent-Type: application/octet-stream\r\n"
+                             b"Connection: close\r\n\r\n")
+                samples = await speak(writer, key, hello, text, voice, speaker, lock)
+                log.info("tts: voice %d, %d bytes of text, %.2fs of speech in %.0f ms",
+                         voice, len(text.encode()), samples / TTS_RATE, (time.monotonic() - t0) * 1000)
+                return
             hello, rate, pcm = await asyncio.wait_for(
                 read_speech(key, body_chunks(reader, headers)), READ_TIMEOUT)
             t1 = time.monotonic()
-            text = await recognizer.transcribe(pcm, rate) if pcm else ""
+            async with lock:
+                text = await recognizer.transcribe(pcm, rate) if pcm else ""
             t2 = time.monotonic()
             reply = json.dumps({"text": text}, ensure_ascii=False).encode()
             await respond(writer, 200, P.seal(key, hello, P.SERVER_COUNTER, P.T_RESULT, reply))
@@ -191,8 +411,10 @@ async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     key = load_key(os.environ.get("MUSE_ASR_KEY_FILE", "/etc/muse-asr/key"))
     recognizer = Recognizer(os.environ.get("MUSE_ASR_MODEL", "/opt/muse-asr/model"))
+    tts_dir = os.environ.get("MUSE_TTS_DIR", "")
+    speaker = Speaker(tts_dir) if tts_dir else None
     host, port = os.environ.get("MUSE_ASR_LISTEN", "127.0.0.1:8102").rsplit(":", 1)
-    server = await asyncio.start_server(make_handler(key, recognizer), host, int(port))
+    server = await asyncio.start_server(make_handler(key, recognizer, speaker), host, int(port))
     log.info("listening on %s:%s", host, port)
     async with server:
         await server.serve_forever()
