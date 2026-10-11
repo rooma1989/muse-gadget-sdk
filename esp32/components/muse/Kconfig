@@ -165,6 +165,50 @@ menu "Muse"
             Without it those characters show as boxes. Hangul isn't
             included.
 
+    config MUSE_ASR_ENABLE
+        bool "Transcribe push-to-talk on your own speech server"
+        depends on MUSE_ENABLED && !MUSE_HATCH
+        default n
+        help
+            Instead of uploading a voice note to Muse, stream the mic to a
+            speech-to-text server of your own (tools/muse_asr) and send Muse
+            the transcript as text. For a board without PSRAM whose path to
+            Muse is slow (e.g. through a relay): a note needs more RAM in
+            flight than it has, and Muse echoes it back in a frame too big
+            for its buffers. Audio is sealed with AES-256-GCM under a key
+            shared with the server; the transport is plain TCP.
+
+    config MUSE_ASR_IP
+        string "Speech server IPv4 address"
+        depends on MUSE_ASR_ENABLE
+        default ""
+
+    config MUSE_ASR_PORT
+        int "Speech server TCP port"
+        depends on MUSE_ASR_ENABLE
+        range 1 65535
+        default 80
+
+    config MUSE_ASR_HOST
+        string "HTTP Host header"
+        depends on MUSE_ASR_ENABLE
+        default ""
+        help
+            For a server behind a virtual host (nginx); empty sends the IP.
+
+    config MUSE_ASR_PATH
+        string "HTTP path"
+        depends on MUSE_ASR_ENABLE
+        default "/asr"
+
+    config MUSE_ASR_KEY
+        string "Shared key (64 hex digits)"
+        depends on MUSE_ASR_ENABLE
+        default ""
+        help
+            The same 32 bytes as the server's key file. Keep it out of Git:
+            set it in your build directory's sdkconfig.
+
     config MUSE_JC3248W535_MIC_GPIO
         int "JC3248W535: GPIO for an external I2S mic's data (SD) line"
         depends on MUSE_BOARD_GUITION_JC3248W535

@@ -39,12 +39,22 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "muse_asr.h"
+#include "muse_audio.h"
 #include "muse_link.h"
 #include "muse_wifi.h"
 
 static const char *TAG = "muse_chat_link";
 
 #define MIC_RATE 16000
+#if CONFIG_RELAY_ROUTE_ENABLE
+/* Through a relay the round trip is long enough that a 16 kHz upload keeps
+ * more unacknowledged TCP data in flight than a board without PSRAM can hold
+ * above the session's DMA reserve, and the note stalls. Send 8 kHz instead. */
+#define NOTE_RATE (MIC_RATE / 2)
+#else
+#define NOTE_RATE MIC_RATE
+#endif
 #define STAGE_BYTES 1536                /* PCM per body chunk: 2 KB of base64, 48 ms */
 #define CHUNK_BYTES (STAGE_BYTES / 3 * 4)
 #define ACK_MAX 2048
@@ -58,6 +68,8 @@ static const char *TAG = "muse_chat_link";
 #define SETTLE_US 3000000               /* quiet after a reply before the turn ends */
 #define REPLY_TIMEOUT_US 60000000
 #define READ_CHARS_PER_S 14             /* caption scroll, about speaking pace */
+#define ASR_TIMEOUT_US 15000000         /* release -> transcript from the speech server */
+#define ASR_TEXT_MAX 600
 
 
 /* A reply being received on Link's session task, read by the voice task once done. */
@@ -84,7 +96,8 @@ typedef struct {
 
 enum { RX_NOTE, RX_SUB, RX_COUNT };
 
-typedef enum { T_IDLE, T_TALKING, T_ACK, T_REPLY } phase_t;
+/* T_ASR: the speech server is transcribing (CONFIG_MUSE_ASR_ENABLE). */
+typedef enum { T_IDLE, T_TALKING, T_ASR, T_ACK, T_REPLY } phase_t;
 
 typedef struct {
     char text[EV_TEXT];
@@ -557,6 +570,9 @@ static void emit(muse_hatch_ev_t type, const char *text)
 
 static void end_turn(void)
 {
+#if CONFIG_MUSE_ASR_ENABLE
+    muse_asr_close();
+#endif
     drop(RX_NOTE);
     drop(RX_SUB);
     free(s_turn.stage);
@@ -708,10 +724,67 @@ static bool scroll(int64_t now)
     return at >= len;
 }
 
+#if CONFIG_MUSE_ASR_ENABLE
+/* Sends the transcript to Muse as a text message; the reply comes as for a note. */
+static void post_text(const char *text)
+{
+    cJSON *body = cJSON_CreateObject();
+    cJSON_AddStringToObject(body, "message", text);
+    cJSON_AddStringToObject(body, "output_modality", "text");
+    char *json = cJSON_PrintUnformatted(body);
+    cJSON_Delete(body);
+    /* Subscribe before posting, so no reply event can come ahead of it. */
+    bool ok = json
+        && request(RX_SUB, "POST", "/chat/subscribe", true, false)
+        && muse_link_req_send(s_stream[RX_SUB], "{}", 2, true, SEND_WAIT_MS)
+        && request(RX_NOTE, "POST", "/chat/stream", true, false)
+        && muse_link_req_send(s_stream[RX_NOTE], json, strlen(json), true, SEND_WAIT_MS);
+    cJSON_free(json);
+    if (!ok) {
+        fail("CAN'T REACH MUSE");
+        return;
+    }
+    s_turn.t_end = esp_timer_get_time();
+    s_turn.phase = T_ACK;
+}
+
+/* Waits for the speech server's transcript, then posts it. */
+static void pump_asr(int64_t now)
+{
+    static char text[ASR_TEXT_MAX];   /* voice task only */
+    int r = muse_asr_poll(text, sizeof(text));
+    if (r == 0) {
+        if (now - s_turn.t_end > ASR_TIMEOUT_US) fail("SPEECH SERVER TIMED OUT");
+        return;
+    }
+    muse_asr_close();
+    if (r < 0) {
+        fail("SPEECH SERVER FAILED");
+        return;
+    }
+    ESP_LOGI(TAG, "transcript after %.2fs: %u bytes", (now - s_turn.t_end) / 1e6, (unsigned)strlen(text));
+    if (!text[0]) {
+        fail("DIDN'T CATCH THAT");
+        return;
+    }
+    char line[EV_TEXT];
+    muse_hatch_tail_words(text, line, sizeof(line));
+    emit(MUSE_HATCH_EV_HEARD, line);
+    s_turn.heard = true;
+    post_text(text);
+}
+#endif
+
 /* Moves the turn along; runs on the voice task each time it asks for events. */
 static void pump(void)
 {
     int64_t now = esp_timer_get_time();
+#if CONFIG_MUSE_ASR_ENABLE
+    if (s_turn.phase == T_ASR) {
+        pump_asr(now);
+        return;
+    }
+#endif
     if (s_turn.phase == T_ACK && received(RX_NOTE)) {
         on_ack();
     }
@@ -825,6 +898,15 @@ void muse_hatch_turn_begin(void)
     end_turn();
     xQueueReset(s_events);
     memset(&s_turn, 0, sizeof(s_turn));
+#if CONFIG_MUSE_ASR_ENABLE
+    /* Speech goes to the speech server; Muse only sees the transcript. */
+    if (!muse_asr_begin()) {
+        fail("CAN'T REACH SPEECH SERVER");
+        return;
+    }
+    s_turn.phase = T_TALKING;
+    return;
+#endif
     s_turn.stage = malloc(STAGE_BYTES);
     s_turn.chunk = malloc(CHUNK_BYTES + sizeof(MUSE_HATCH_NOTE_TAIL));
     if (!s_turn.stage || !s_turn.chunk) {
@@ -836,15 +918,13 @@ void muse_hatch_turn_begin(void)
         fail("CAN'T REACH MUSE");
         return;
     }
-    muse_hatch_wav_header(s_turn.stage, MIC_RATE);
+    muse_hatch_wav_header(s_turn.stage, NOTE_RATE);
     s_turn.stage_len = MUSE_HATCH_WAV_HEADER;
     s_turn.phase = T_TALKING;
 }
 
-void muse_hatch_turn_audio(const int16_t *pcm, size_t frames)
+static void stage_pcm(const uint8_t *p, size_t n)
 {
-    const uint8_t *p = (const uint8_t *)pcm;
-    size_t n = frames * 2;
     while (s_turn.phase == T_TALKING && n) {
         size_t take = STAGE_BYTES - s_turn.stage_len < n ? STAGE_BYTES - s_turn.stage_len : n;
         memcpy(s_turn.stage + s_turn.stage_len, p, take);
@@ -857,6 +937,29 @@ void muse_hatch_turn_audio(const int16_t *pcm, size_t frames)
     }
 }
 
+void muse_hatch_turn_audio(const int16_t *pcm, size_t frames)
+{
+#if CONFIG_MUSE_ASR_ENABLE
+    if (s_turn.phase == T_TALKING && !muse_asr_audio(pcm, frames)) fail("SPEECH SERVER DROPPED");
+    return;
+#endif
+#if NOTE_RATE == MIC_RATE
+    stage_pcm((const uint8_t *)pcm, frames * 2);
+#else
+    /* 2:1, averaging each pair: a crude low-pass, plenty for speech. */
+    int16_t half[MUSE_AUDIO_CHUNK / 2];
+    while (s_turn.phase == T_TALKING && frames >= 2) {
+        size_t m = 0;
+        while (m < sizeof(half) / sizeof(half[0]) && frames >= 2) {
+            half[m++] = (int16_t)(((int32_t)pcm[0] + pcm[1]) / 2);
+            pcm += 2;
+            frames -= 2;
+        }
+        stage_pcm((const uint8_t *)half, m * 2);
+    }
+#endif
+}
+
 void muse_hatch_turn_end(void)
 {
     if (s_turn.phase != T_TALKING) {
@@ -864,6 +967,15 @@ void muse_hatch_turn_end(void)
         emit(MUSE_HATCH_EV_ERROR, s_turn.error[0] ? s_turn.error : "CAN'T REACH MUSE");
         return;
     }
+#if CONFIG_MUSE_ASR_ENABLE
+    if (!muse_asr_end()) {
+        fail("SPEECH SERVER DROPPED");
+        return;
+    }
+    s_turn.t_end = esp_timer_get_time();
+    s_turn.phase = T_ASR;
+    return;
+#endif
     /* Subscribe only after recording: keep inbound reply traffic out of the
      * real-time audio upload. Queue it before the note's final body chunk. */
     if (!request(RX_SUB, "POST", "/chat/subscribe", true, false)

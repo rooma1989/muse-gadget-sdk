@@ -47,6 +47,7 @@ if(CONFIG_MUSE_ENABLED)
         list(APPEND embed "test_reply.mp3")   # muse_hatch_mp3_selftest
     else()
         list(APPEND srcs "muse_chat_link.c")   # text replies over Link's session
+        list(APPEND srcs "muse_asr.c")         # push-to-talk via your own speech server
     endif()
     list(APPEND srcs "muse_chat_text.c")
     if(CONFIG_MUSE_CJK_FONT)
