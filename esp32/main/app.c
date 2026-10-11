@@ -866,6 +866,15 @@ static bool ensure_access_token_ready_with_gate_held(
     }
 
     refresh = load_token_unlocked("refresh_token");
+    if (!refresh && config_has_str("refresh_token")) {
+        // Stored but unreadable: the buffer allocation failed (a voice note
+        // upload can leave little heap on boards without PSRAM). Minting from
+        // the access token would be refused and wipe a good pairing.
+        ESP_LOGW(TAG, "refresh_token unreadable (largest free block %u); keeping current token",
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+        ok = allow_stale_on_refresh_failure;
+        goto done;
+    }
     if (!refresh) {
         ESP_LOGI(TAG, "access_token has no refresh_token; minting device pair");
         ok = mint_and_store_device_tokens_unlocked(access, NULL);

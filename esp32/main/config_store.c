@@ -75,6 +75,17 @@ bool config_get_str(const char *key, char *out, size_t buf_size) {
     return err == ESP_OK;
 }
 
+bool config_has_str(const char *key) {
+    nvs_handle_t h;
+    if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) {
+        return false;
+    }
+    size_t len = 0;
+    esp_err_t err = nvs_get_str(h, key, NULL, &len);
+    nvs_close(h);
+    return err == ESP_OK && len > 1;
+}
+
 bool config_set_str(const char *key, const char *value) {
     nvs_handle_t h;
     if (nvs_open(NS, NVS_READWRITE, &h) != ESP_OK) {
