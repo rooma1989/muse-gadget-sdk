@@ -21,9 +21,13 @@
 
 #include "esp_app_desc.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/task.h"
 
 #include "muse_battery.h"
 #include "muse_ble.h"
@@ -75,6 +79,9 @@ typedef enum {
     ITEM_INFO,
     ITEM_BATTERY,
     ITEM_RESET,
+#if CONFIG_MUSE_TV_SLOT
+    ITEM_TV,
+#endif
     ITEM_SLEEP_NOW,
     ITEM_POWER,
     ITEM_CLOSE,
@@ -95,6 +102,9 @@ static const char *const ITEM_NAMES[ITEM_COUNT] = {
     [ITEM_INFO] = "Status",
     [ITEM_BATTERY] = "Battery",
     [ITEM_RESET] = "Reset pairing",
+#if CONFIG_MUSE_TV_SLOT
+    [ITEM_TV] = "TV",
+#endif
     [ITEM_SLEEP_NOW] = "Screen off",
     [ITEM_POWER] = "Power off",
     [ITEM_CLOSE] = "Close menu",
@@ -115,6 +125,9 @@ static const char *const ITEM_ACTIONS[ITEM_COUNT] = {
     [ITEM_INFO] = "Open",
     [ITEM_BATTERY] = "Open",
     [ITEM_RESET] = "Select",
+#if CONFIG_MUSE_TV_SLOT
+    [ITEM_TV] = "Open",
+#endif
     [ITEM_SLEEP_NOW] = "Select",
     [ITEM_POWER] = "Select",
     [ITEM_CLOSE] = "Close",
@@ -206,6 +219,43 @@ static const char *sleep_name(int secs)
     return "Custom";
 }
 
+#if CONFIG_MUSE_TV_SLOT
+/* The TV player kept in ota_1 (CONFIG_MUSE_TV_SLOT): Muse hands the device to
+ * it by booting that slot, and it hands it back the same way. */
+static const esp_partition_t *tv_slot(void)
+{
+    return esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL);
+}
+
+/* Whether ota_1 holds an app at all; read once, as the menu redraws often. */
+static bool tv_installed(void)
+{
+    static int known = -1;
+    if (known < 0) {
+        esp_app_desc_t desc;
+        const esp_partition_t *slot = tv_slot();
+        known = slot && esp_ota_get_partition_description(slot, &desc) == ESP_OK;
+    }
+    return known;
+}
+
+static void tv_start(void)
+{
+    const esp_partition_t *slot = tv_slot();
+    /* Checks the image and its signature before switching. */
+    esp_err_t err = slot && tv_installed() ? esp_ota_set_boot_partition(slot) : ESP_ERR_NOT_FOUND;
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "can't start the TV: %s", esp_err_to_name(err));
+        muse_state_set_caption("NO TV PLAYER INSTALLED");
+        return;
+    }
+    ESP_LOGI(TAG, "starting the TV");
+    muse_state_set_caption("STARTING TV...");
+    vTaskDelay(pdMS_TO_TICKS(300));
+    esp_restart();
+}
+#endif
+
 static void value_text(int item, char *buf, size_t n)
 {
     static const char *const WIFI_VALUES[] = { "Off", "Not set", "Joining", "On", "Failed", "Not found" };
@@ -219,6 +269,11 @@ static void value_text(int item, char *buf, size_t n)
     case ITEM_SPEAKER:
         strlcpy(buf, muse_settings_speaker_on() ? "On" : "Off", n);
         break;
+#if CONFIG_MUSE_TV_SLOT
+    case ITEM_TV:
+        strlcpy(buf, tv_installed() ? "" : "None", n);
+        break;
+#endif
 #if CONFIG_MUSE_ASR_ENABLE
     case ITEM_VOICE: {
         int v = muse_settings_voice();
@@ -448,6 +503,12 @@ static void activate(int item, int direction)
         muse_menu_close();
         muse_state_set_asleep(true);
         return;
+#if CONFIG_MUSE_TV_SLOT
+    case ITEM_TV:
+        muse_menu_close();
+        tv_start();
+        return;
+#endif
     case ITEM_RESET:
         show(VIEW_RESET);
         return;

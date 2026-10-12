@@ -165,6 +165,17 @@ menu "Muse"
             Without it those characters show as boxes. Hangul isn't
             included.
 
+    config MUSE_TV_SLOT
+        bool "Menu item that boots a TV player kept in the second app slot"
+        depends on MUSE_ENABLED
+        default n
+        help
+            For a board whose ota_1 holds another firmware (the AI Passport's
+            TV player, ai-passport-tv's sdkconfig.muse-dual): Settings > TV
+            boots it, and it boots Muse again from its own menu. Leave OTA
+            off on such a board: an update would overwrite that slot. The
+            image must be signed with this build's key, as switching checks it.
+
     config MUSE_ASR_ENABLE
         bool "Transcribe push-to-talk on your own speech server"
         depends on MUSE_ENABLED && !MUSE_HATCH
