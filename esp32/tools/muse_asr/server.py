@@ -15,14 +15,32 @@ sherpa-onnx read a reply aloud, sentence by sentence, as 16 kHz IMA ADPCM.
   MUSE_TTS_DIR       directory holding the VITS voices' model directories (VOICES);
                      empty: no /tts
   MUSE_ASR_LISTEN    host:port (127.0.0.1:8102)
+  MUSE_ASR_SOCKET    path of a Unix socket for local clients such as the TV media
+                     server (/run/muse-asr/asr.sock); empty: none. See below.
+  MUSE_ASR_SOCKET_GROUP  group the socket is given (e.g. tvserver); the process
+                     must be a member. Empty: the process's own group.
+
+The Unix socket speaks plain HTTP without the AES framing, because the clients
+on this host have no key: whoever may open the socket (mode 0660, owner and
+group) may transcribe, and nobody else can. POST /asr with a Content-Length
+body of PCM16 LE mono at X-Sample-Rate (default 16000) answers 200 with
+{"text": ...}; GET /health answers ok. TTS is not offered there.
+
+Recognition has its own lock, separate from speech synthesis: a Muse reply being
+read aloud (slower than real time on a small host) holds the TTS lock for each
+sentence, and a TV's voice command must not wait behind it. The two run on
+different sherpa-onnx models, so they may overlap; requests of the same kind
+still go one at a time.
 
 Transcripts and replies are never logged, only their lengths.
 """
 
 import asyncio
+import grp
 import json
 import logging
 import os
+import stat
 import re
 import struct
 import sys
@@ -346,8 +364,11 @@ async def respond(writer, status, body, ctype="application/octet-stream"):
     await writer.drain()
 
 
-def make_handler(key, recognizer, speaker=None, lock=None):
+def make_handler(key, recognizer, speaker=None, lock=None, asr_lock=None):
+    """`lock` serialises TTS, `asr_lock` serialises recognition (shared with the
+    local handler, so the two entrances take turns on the one model)."""
     lock = lock or asyncio.Lock()
+    asr_lock = asr_lock or asyncio.Lock()
 
     async def handle(reader, writer):
         t0 = time.monotonic()
@@ -371,7 +392,7 @@ def make_handler(key, recognizer, speaker=None, lock=None):
             hello, rate, pcm = await asyncio.wait_for(
                 read_speech(key, body_chunks(reader, headers)), READ_TIMEOUT)
             t1 = time.monotonic()
-            async with lock:
+            async with asr_lock:
                 text = await recognizer.transcribe(pcm, rate) if pcm else ""
             t2 = time.monotonic()
             reply = json.dumps({"text": text}, ensure_ascii=False).encode()
@@ -399,6 +420,83 @@ def make_handler(key, recognizer, speaker=None, lock=None):
     return handle
 
 
+LOCAL_RATES = (8000, 16000, 24000)
+
+
+def make_local_handler(recognizer, asr_lock=None):
+    """Plain POST /asr for clients on this host, over the Unix socket (see the module doc)."""
+    asr_lock = asr_lock or asyncio.Lock()
+
+    async def handle(reader, writer):
+        t0 = time.monotonic()
+        try:
+            method, path, headers = await asyncio.wait_for(read_headers(reader), 10)
+            route = path.split("?", 1)[0].rstrip("/")
+            if method == "GET" and route.endswith("/health"):
+                await respond(writer, 200, b"ok\n", "text/plain")
+                return
+            if method != "POST":
+                raise HttpError(405, "POST only")
+            if not route.endswith("/asr"):
+                raise HttpError(404, "no such path")
+            try:
+                rate = int(headers.get("x-sample-rate", "16000"))
+                length = int(headers.get("content-length", ""))
+            except ValueError:
+                raise HttpError(400, "bad rate or length") from None
+            if rate not in LOCAL_RATES:
+                raise HttpError(400, "bad rate")
+            if not 0 <= length <= MAX_SECONDS * rate * 2 or length % 2:
+                raise HttpError(400, "bad length")
+            pcm = await asyncio.wait_for(reader.readexactly(length), READ_TIMEOUT)
+            t1 = time.monotonic()
+            async with asr_lock:
+                text = await recognizer.transcribe(pcm, rate) if pcm else ""
+            t2 = time.monotonic()
+            await respond(writer, 200, json.dumps({"text": text}, ensure_ascii=False).encode(),
+                          "application/json")
+            log.info("local ok: %.2fs of %d Hz audio, upload %.0f ms, asr %.0f ms, %d chars",
+                     len(pcm) / 2 / rate, rate, (t1 - t0) * 1000, (t2 - t1) * 1000, len(text))
+        except HttpError as e:
+            await respond(writer, e.status, (e.reason + "\n").encode(), "text/plain")
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError, ValueError) as e:
+            log.warning("local dropped: %s", type(e).__name__)
+        except Exception:
+            log.exception("local failed")
+            try:
+                await respond(writer, 500, b"error\n", "text/plain")
+            except Exception:
+                pass
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+    return handle
+
+
+async def start_local(handler, path, group=""):
+    """Listens on the Unix socket `path`, mode 0660, in `group` if given.
+
+    A socket left by an earlier run is replaced; any other file there is not
+    touched (refuses to start instead)."""
+    try:
+        if not stat.S_ISSOCK(os.lstat(path).st_mode):
+            raise SystemExit(f"{path}: exists and is not a socket")
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    old = os.umask(0o117)               # created 0660, never wider for a moment
+    try:
+        server = await asyncio.start_unix_server(handler, path)
+    finally:
+        os.umask(old)
+    if group:
+        os.chown(path, -1, grp.getgrnam(group).gr_gid)
+    os.chmod(path, 0o660)
+    return server
+
+
 def load_key(path):
     with open(path) as f:
         key = bytes.fromhex(f.read().strip())
@@ -414,10 +512,17 @@ async def main():
     tts_dir = os.environ.get("MUSE_TTS_DIR", "")
     speaker = Speaker(tts_dir) if tts_dir else None
     host, port = os.environ.get("MUSE_ASR_LISTEN", "127.0.0.1:8102").rsplit(":", 1)
-    server = await asyncio.start_server(make_handler(key, recognizer, speaker), host, int(port))
+    asr_lock = asyncio.Lock()
+    server = await asyncio.start_server(make_handler(key, recognizer, speaker, asr_lock=asr_lock),
+                                        host, int(port))
     log.info("listening on %s:%s", host, port)
-    async with server:
-        await server.serve_forever()
+    servers = [server]
+    path = os.environ.get("MUSE_ASR_SOCKET", "")
+    if path:
+        servers.append(await start_local(make_local_handler(recognizer, asr_lock), path,
+                                         os.environ.get("MUSE_ASR_SOCKET_GROUP", "")))
+        log.info("listening on %s", path)
+    await asyncio.gather(*(s.serve_forever() for s in servers))
 
 
 if __name__ == "__main__":

@@ -10,6 +10,16 @@ Environment=MUSE_ASR_KEY_FILE=/etc/muse-asr/key
 Environment=MUSE_ASR_MODEL=/opt/muse-asr/model
 Environment=MUSE_TTS_DIR=/opt/muse-asr
 Environment=MUSE_ASR_LISTEN=127.0.0.1:8102
+# Plain local socket for the TV media servers (ai-passport-tv, TV_ASR_SOCKET), no key:
+# only the owner and the tvserver group may open it (0660). Leave these two lines out
+# on a host without the TV server, and the three lines after them.
+Environment=MUSE_ASR_SOCKET=/run/muse-asr/asr.sock
+Environment=MUSE_ASR_SOCKET_GROUP=tvserver
+# /run/muse-asr, recreated at each start; 0755 so tvserver can reach the socket in it.
+RuntimeDirectory=muse-asr
+RuntimeDirectoryMode=0755
+# Needed to hand the socket to the tvserver group.
+SupplementaryGroups=tvserver
 ExecStart=/opt/muse-asr/venv/bin/python /opt/muse-asr/app/server.py
 Restart=on-failure
 RestartSec=3

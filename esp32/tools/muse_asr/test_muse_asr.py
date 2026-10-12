@@ -4,6 +4,7 @@
 """
 
 import asyncio
+import json
 import os
 import random
 import shutil
@@ -238,6 +239,115 @@ class TtsTests(unittest.TestCase):
         status, _ = asyncio.run(roundtrip(raw, FakeRecognizer(), spk))
         self.assertEqual(status, 403)
         self.assertEqual(spk.said, [])
+
+
+async def local_roundtrip(raw, recognizer, path, asr_lock=None):
+    srv = await server.start_local(server.make_local_handler(recognizer, asr_lock), path)
+    async with srv:
+        r, w = await asyncio.open_unix_connection(path)
+        w.write(raw)
+        await w.drain()
+        resp = await r.read()
+        w.close()
+    head, _, body = resp.partition(b"\r\n\r\n")
+    return int(head.split(b" ")[1]), body
+
+
+def local_request(pcm, rate=None, path=b"/asr"):
+    head = b"POST " + path + b" HTTP/1.1\r\nHost: muse-asr\r\nContent-Length: %d\r\n" % len(pcm)
+    if rate is not None:
+        head += b"X-Sample-Rate: %d\r\n" % rate
+    return head + b"\r\n" + pcm
+
+
+class LocalSocketTests(unittest.TestCase):
+    """The plain Unix-socket entrance for clients on this host (the TV media server)."""
+
+    def setUp(self):
+        # A short directory: Unix socket paths are limited to about 100 bytes.
+        self.dir = tempfile.mkdtemp(prefix="masr", dir="/tmp" if os.path.isdir("/tmp") else None)
+        self.path = os.path.join(self.dir, "asr.sock")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_transcribes_plain_pcm(self):
+        rec = FakeRecognizer()
+        status, body = asyncio.run(local_roundtrip(local_request(bytes(32000)), rec, self.path))
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"text": "你好，世界"})
+        self.assertEqual(rec.calls, [(32000, 16000)])
+
+    def test_rate_header_and_limits(self):
+        rec = FakeRecognizer()
+        status, _ = asyncio.run(local_roundtrip(local_request(bytes(1600), 8000), rec, self.path))
+        self.assertEqual(status, 200)
+        self.assertEqual(rec.calls, [(1600, 8000)])
+        # Too long is refused from the header alone, before any of the body is read.
+        too_long = b"POST /asr HTTP/1.1\r\nContent-Length: %d\r\n\r\n" % (server.MAX_SECONDS * 32000 + 2)
+        for raw in (local_request(bytes(1600), 44100), local_request(bytes(3)), too_long):
+            status, _ = asyncio.run(local_roundtrip(raw, rec, self.path))
+            self.assertEqual(status, 400)
+        self.assertEqual(len(rec.calls), 1, "refused requests are never transcribed")
+
+    def test_only_asr_and_health(self):
+        rec = FakeRecognizer()
+        status, _ = asyncio.run(local_roundtrip(local_request(b"x", path=b"/tts"), rec, self.path))
+        self.assertEqual(status, 404)
+        status, body = asyncio.run(local_roundtrip(b"GET /health HTTP/1.1\r\n\r\n", rec, self.path))
+        self.assertEqual((status, body), (200, b"ok\n"))
+        status, _ = asyncio.run(local_roundtrip(b"GET /asr HTTP/1.1\r\n\r\n", rec, self.path))
+        self.assertEqual(status, 405)
+
+    def test_socket_mode_group_and_stale_file(self):
+        import grp
+        import stat
+
+        async def run():
+            srv = await server.start_local(server.make_local_handler(FakeRecognizer()), self.path,
+                                           grp.getgrgid(os.getgid()).gr_name)
+            info = os.stat(self.path)
+            srv.close()
+            await srv.wait_closed()
+            return info
+
+        info = asyncio.run(run())
+        self.assertTrue(stat.S_ISSOCK(info.st_mode))
+        self.assertEqual(stat.S_IMODE(info.st_mode), 0o660)
+        self.assertEqual(info.st_gid, os.getgid())
+        # A socket left behind by a crash is replaced on the next start.
+        asyncio.run(local_roundtrip(local_request(bytes(2)), FakeRecognizer(), self.path))
+        os.unlink(self.path)
+        with open(self.path, "w") as f:
+            f.write("not a socket")
+        with self.assertRaises(SystemExit):
+            asyncio.run(local_roundtrip(local_request(bytes(2)), FakeRecognizer(), self.path))
+
+    def test_recognition_does_not_wait_for_speech_synthesis(self):
+        """A reply being read aloud holds the TTS lock; the TV's command still goes through."""
+        rec = FakeRecognizer()
+
+        async def run():
+            tts_lock, asr_lock = asyncio.Lock(), asyncio.Lock()
+            await tts_lock.acquire()           # a sentence being synthesised
+            local = asyncio.wait_for(local_roundtrip(local_request(bytes(3200)), rec, self.path, asr_lock), 3)
+            hello = P.make_hello(os.urandom(8), 16000)
+            raw = request(chunked(speech_frames(hello, bytes(3200))))
+            srv = await asyncio.start_server(server.make_handler(KEY, rec, None, tts_lock, asr_lock),
+                                             "127.0.0.1", 0)
+            port = srv.sockets[0].getsockname()[1]
+            async with srv:
+                r, w = await asyncio.open_connection("127.0.0.1", port)
+                w.write(raw)
+                await w.drain()
+                remote = await asyncio.wait_for(r.read(), 3)
+                w.close()
+            return await local, remote
+
+        (status, _), remote = asyncio.run(run())
+        self.assertEqual(status, 200)
+        self.assertTrue(remote.startswith(b"HTTP/1.1 200"))
+        self.assertEqual(len(rec.calls), 2)
 
 
 ADPCM_C = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../components/muse/muse_adpcm.c")
